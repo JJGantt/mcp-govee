@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""MCP server for controlling Govee smart lights and home devices."""
+"""MCP server for controlling Govee smart lights."""
 
 import os
-import socket
 import uuid
 from pathlib import Path
 
@@ -175,20 +174,6 @@ async def set_color_temp(light: str, kelvin: int) -> str:
     kelvin = max(2000, min(9000, kelvin))
     result = await _control(info["sku"], info["device"], "devices.capabilities.color_setting", "colorTemperatureK", kelvin)
     return f"Set {info['name']} color temperature to {kelvin}K." if result.get("code") == 200 else str(result)
-
-
-@mcp.tool()
-def wake_apple_tv() -> str:
-    """Wake the Apple TV from sleep by sending a Wake-on-LAN magic packet."""
-    mac = os.getenv("APPLE_TV_MAC", "").strip()
-    if not mac:
-        return "APPLE_TV_MAC not set in .env-govee"
-    mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
-    magic = b"\xff" * 6 + mac_bytes * 16
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.sendto(magic, ("255.255.255.255", 9))
-    return "Wake-on-LAN packet sent to Apple TV."
 
 
 if __name__ == "__main__":
