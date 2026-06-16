@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
-"""MCP server for controlling Govee smart lights."""
+"""MCP server for controlling Govee smart lights.
 
+Transport is LAN-first with cloud fallback:
+  * Each command first discovers the target lamp on the local network via the
+    Govee LAN multicast scan. If the lamp answers, the command goes straight to
+    it over UDP (~10ms, no rate limits, immune to Govee cloud outages).
+  * If the lamp does not answer the scan (LAN control off, lamp off-network, or
+    we're away from home), the command falls back to the Govee cloud REST API.
+
+LAN protocol: scan request -> 239.255.255.250:4001, responses arrive on :4002,
+device commands/status -> <device_ip>:4003.
+"""
+
+import asyncio
+import json
 import os
+import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -17,6 +32,13 @@ HEADERS = {
     "Content-Type": "application/json",
     "Govee-API-Key": API_KEY,
 }
+
+# LAN protocol constants
+LAN_MCAST = ("239.255.255.250", 4001)
+LAN_RECV_PORT = 4002
+LAN_CMD_PORT = 4003
+LAN_SCAN_TIMEOUT = 1.2
+LAN_CACHE_TTL = 30.0  # seconds to trust a discovered device IP before re-scanning
 
 # Load lights from env: GOVEE_LIGHT_<NAME>=<sku>,<device_id>,<display_name>
 LIGHTS = {}
@@ -51,6 +73,10 @@ def rgb_to_int(r: int, g: int, b: int) -> int:
     return (r << 16) | (g << 8) | b
 
 
+def int_to_rgb(value: int) -> tuple:
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+
+
 def parse_color(color_str: str) -> int:
     s = color_str.strip().lower()
     if s in NAMED_COLORS:
@@ -66,7 +92,116 @@ def parse_color(color_str: str) -> int:
     )
 
 
-async def _control(sku: str, device: str, cap_type: str, instance: str, value) -> dict:
+# ---------------------------------------------------------------------------
+# LAN transport
+# ---------------------------------------------------------------------------
+
+_lan_cache: dict = {}  # device_id -> (ip, timestamp)
+
+
+def _open_recv_socket() -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    s.bind(("0.0.0.0", LAN_RECV_PORT))
+    return s
+
+
+def _lan_scan_blocking(timeout: float = LAN_SCAN_TIMEOUT) -> dict:
+    """Multicast scan for LAN-enabled Govee devices. Returns {device_id: ip}."""
+    found = {}
+    recv = None
+    send = None
+    try:
+        recv = _open_recv_socket()
+        recv.settimeout(timeout)
+        send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        send.sendto(
+            json.dumps({"msg": {"cmd": "scan", "data": {"account_topic": "reserve"}}}).encode(),
+            LAN_MCAST,
+        )
+        deadline = time.time() + timeout + 0.3
+        while time.time() < deadline:
+            try:
+                data, addr = recv.recvfrom(2048)
+            except socket.timeout:
+                break
+            try:
+                d = json.loads(data.decode()).get("msg", {}).get("data", {})
+            except (ValueError, UnicodeDecodeError):
+                continue
+            dev = d.get("device")
+            if dev:
+                found[dev] = d.get("ip") or addr[0]
+    finally:
+        if recv is not None:
+            recv.close()
+        if send is not None:
+            send.close()
+    return found
+
+
+def _resolve_lan_ip_blocking(device_id: str) -> str | None:
+    """Return the current LAN IP for a device, or None if it isn't reachable."""
+    cached = _lan_cache.get(device_id)
+    if cached and (time.time() - cached[1]) < LAN_CACHE_TTL:
+        return cached[0]
+    now = time.time()
+    for dev, ip in _lan_scan_blocking().items():
+        _lan_cache[dev] = (ip, now)
+    cached = _lan_cache.get(device_id)
+    if cached and (time.time() - cached[1]) < LAN_CACHE_TTL:
+        return cached[0]
+    return None
+
+
+def _lan_send_blocking(ip: str, msg: dict) -> None:
+    """Fire a single LAN command packet (fire-and-forget UDP)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.sendto(json.dumps(msg).encode(), (ip, LAN_CMD_PORT))
+    finally:
+        s.close()
+
+
+def _lan_status_blocking(ip: str, timeout: float = 1.0) -> dict | None:
+    """Query a lamp's live state over LAN. Returns the devStatus data dict or None."""
+    recv = None
+    send = None
+    try:
+        recv = _open_recv_socket()
+        recv.settimeout(timeout)
+        send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send.sendto(json.dumps({"msg": {"cmd": "devStatus", "data": {}}}).encode(), (ip, LAN_CMD_PORT))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, _ = recv.recvfrom(2048)
+            except socket.timeout:
+                return None
+            try:
+                m = json.loads(data.decode()).get("msg", {})
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if m.get("cmd") == "devStatus":
+                return m.get("data", {})
+    finally:
+        if recv is not None:
+            recv.close()
+        if send is not None:
+            send.close()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Cloud transport
+# ---------------------------------------------------------------------------
+
+async def _cloud_control(sku: str, device: str, cap_type: str, instance: str, value) -> dict:
     payload = {
         "requestId": str(uuid.uuid4()),
         "payload": {
@@ -80,7 +215,7 @@ async def _control(sku: str, device: str, cap_type: str, instance: str, value) -
         return r.json()
 
 
-async def _get_state(sku: str, device: str) -> dict:
+async def _cloud_state(sku: str, device: str) -> dict:
     payload = {
         "requestId": str(uuid.uuid4()),
         "payload": {"sku": sku, "device": device},
@@ -91,19 +226,64 @@ async def _get_state(sku: str, device: str) -> dict:
         return {c["instance"]: c["state"]["value"] for c in data["payload"]["capabilities"]}
 
 
+# ---------------------------------------------------------------------------
+# Unified send: LAN-first, cloud fallback
+# ---------------------------------------------------------------------------
+
+async def _send(info: dict, lan_msg: dict, cloud_cap: tuple, success_label: str) -> str:
+    """Try LAN first; fall back to the cloud capability if the lamp isn't on the LAN.
+
+    cloud_cap is (cap_type, instance, value).
+    """
+    ip = await asyncio.to_thread(_resolve_lan_ip_blocking, info["device"])
+    if ip:
+        await asyncio.to_thread(_lan_send_blocking, ip, lan_msg)
+        return f"{success_label} (via LAN)."
+    result = await _cloud_control(info["sku"], info["device"], *cloud_cap)
+    if result.get("code") == 200:
+        return f"{success_label} (via cloud)."
+    return f"Failed (LAN unreachable, cloud error): {result}"
+
+
 mcp = FastMCP("govee-lights")
 
 
 @mcp.tool()
 async def list_lights() -> str:
-    """List all configured lights and their current state (online, power, brightness)."""
+    """List all configured lights and their current state (online, power, brightness).
+
+    State is read over LAN when the lamp is reachable locally, otherwise via the cloud.
+    """
+    reachable = await asyncio.to_thread(_lan_scan_blocking)
+    now = time.time()
+    for dev, ip in reachable.items():
+        _lan_cache[dev] = (ip, now)
+
     lines = []
     for name, info in LIGHTS.items():
-        state = await _get_state(info["sku"], info["device"])
-        online = state.get("online", False)
-        power = "on" if state.get("powerSwitch") == 1 else "off"
-        brightness = state.get("brightness", "?")
-        lines.append(f"{name} ({info['name']}): online={online}, power={power}, brightness={brightness}%")
+        ip = reachable.get(info["device"])
+        if ip:
+            status = await asyncio.to_thread(_lan_status_blocking, ip)
+            if status is not None:
+                power = "on" if status.get("onOff") == 1 else "off"
+                brightness = status.get("brightness", "?")
+                lines.append(
+                    f"{name} ({info['name']}): online=True, power={power}, "
+                    f"brightness={brightness}% [LAN {ip}]"
+                )
+                continue
+        # Cloud fallback for state
+        try:
+            state = await _cloud_state(info["sku"], info["device"])
+            online = state.get("online", False)
+            power = "on" if state.get("powerSwitch") == 1 else "off"
+            brightness = state.get("brightness", "?")
+            lines.append(
+                f"{name} ({info['name']}): online={online}, power={power}, "
+                f"brightness={brightness}% [cloud]"
+            )
+        except Exception as e:
+            lines.append(f"{name} ({info['name']}): state unavailable ({e})")
     return "\n".join(lines)
 
 
@@ -112,15 +292,19 @@ async def set_power(light: str, state: str) -> str:
     """Turn a light on or off.
 
     Args:
-        light: Light name (e.g. 'office_lamp')
+        light: Light name (e.g. 'floor_lamp')
         state: 'on' or 'off'
     """
     if light not in LIGHTS:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
     info = LIGHTS[light]
     value = 1 if state.lower() in ("on", "1", "true") else 0
-    result = await _control(info["sku"], info["device"], "devices.capabilities.on_off", "powerSwitch", value)
-    return f"Turned {info['name']} {state}." if result.get("code") == 200 else str(result)
+    return await _send(
+        info,
+        {"msg": {"cmd": "turn", "data": {"value": value}}},
+        ("devices.capabilities.on_off", "powerSwitch", value),
+        f"Turned {info['name']} {state}",
+    )
 
 
 @mcp.tool()
@@ -128,15 +312,19 @@ async def set_brightness(light: str, brightness: int) -> str:
     """Set brightness of a light.
 
     Args:
-        light: Light name (e.g. 'office_lamp')
+        light: Light name (e.g. 'floor_lamp')
         brightness: 1–100
     """
     if light not in LIGHTS:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
     info = LIGHTS[light]
     brightness = max(1, min(100, brightness))
-    result = await _control(info["sku"], info["device"], "devices.capabilities.range", "brightness", brightness)
-    return f"Set {info['name']} brightness to {brightness}%." if result.get("code") == 200 else str(result)
+    return await _send(
+        info,
+        {"msg": {"cmd": "brightness", "data": {"value": brightness}}},
+        ("devices.capabilities.range", "brightness", brightness),
+        f"Set {info['name']} brightness to {brightness}%",
+    )
 
 
 @mcp.tool()
@@ -144,7 +332,7 @@ async def set_color(light: str, color: str) -> str:
     """Set the color of a light.
 
     Args:
-        light: Light name (e.g. 'office_lamp')
+        light: Light name (e.g. 'floor_lamp')
         color: Color name (red, blue, green, purple, orange, pink, cyan, white, warm white,
                yellow, teal, lavender, coral, lime, gold, indigo, magenta),
                hex string (#FF0000), or r,g,b values (255,0,0)
@@ -156,8 +344,13 @@ async def set_color(light: str, color: str) -> str:
         color_int = parse_color(color)
     except ValueError as e:
         return str(e)
-    result = await _control(info["sku"], info["device"], "devices.capabilities.color_setting", "colorRgb", color_int)
-    return f"Set {info['name']} to {color}." if result.get("code") == 200 else str(result)
+    r, g, b = int_to_rgb(color_int)
+    return await _send(
+        info,
+        {"msg": {"cmd": "colorwc", "data": {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}}},
+        ("devices.capabilities.color_setting", "colorRgb", color_int),
+        f"Set {info['name']} to {color}",
+    )
 
 
 @mcp.tool()
@@ -165,15 +358,19 @@ async def set_color_temp(light: str, kelvin: int) -> str:
     """Set color temperature of a light in Kelvin. 2000K = warm/candlelight, 4000K = neutral, 6500K = daylight, 9000K = cool blue-white.
 
     Args:
-        light: Light name (e.g. 'office_lamp')
+        light: Light name (e.g. 'floor_lamp')
         kelvin: Color temperature in Kelvin (2000–9000)
     """
     if light not in LIGHTS:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
     info = LIGHTS[light]
     kelvin = max(2000, min(9000, kelvin))
-    result = await _control(info["sku"], info["device"], "devices.capabilities.color_setting", "colorTemperatureK", kelvin)
-    return f"Set {info['name']} color temperature to {kelvin}K." if result.get("code") == 200 else str(result)
+    return await _send(
+        info,
+        {"msg": {"cmd": "colorwc", "data": {"color": {"r": 0, "g": 0, "b": 0}, "colorTemInKelvin": kelvin}}},
+        ("devices.capabilities.color_setting", "colorTemperatureK", kelvin),
+        f"Set {info['name']} color temperature to {kelvin}K",
+    )
 
 
 if __name__ == "__main__":
