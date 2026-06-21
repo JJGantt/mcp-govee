@@ -110,8 +110,10 @@ def _open_recv_socket() -> socket.socket:
     return s
 
 
-def _lan_scan_blocking(timeout: float = LAN_SCAN_TIMEOUT) -> dict:
-    """Multicast scan for LAN-enabled Govee devices. Returns {device_id: ip}."""
+def _lan_scan_blocking(timeout: float = LAN_SCAN_TIMEOUT, want: str | None = None) -> dict:
+    """Multicast scan for LAN-enabled Govee devices. Returns {device_id: ip}. Early-exits the instant
+    `want` (a specific device_id) answers, so resolving one known light is ~one round-trip (~0.2s)
+    instead of waiting out the whole timeout window every command."""
     found = {}
     recv = None
     send = None
@@ -137,6 +139,8 @@ def _lan_scan_blocking(timeout: float = LAN_SCAN_TIMEOUT) -> dict:
             dev = d.get("device")
             if dev:
                 found[dev] = d.get("ip") or addr[0]
+                if want and want in found:
+                    break       # got the light we were after — stop waiting on the timeout
     finally:
         if recv is not None:
             recv.close()
@@ -151,7 +155,7 @@ def _resolve_lan_ip_blocking(device_id: str) -> str | None:
     if cached and (time.time() - cached[1]) < LAN_CACHE_TTL:
         return cached[0]
     now = time.time()
-    for dev, ip in _lan_scan_blocking().items():
+    for dev, ip in _lan_scan_blocking(want=device_id).items():
         _lan_cache[dev] = (ip, now)
     cached = _lan_cache.get(device_id)
     if cached and (time.time() - cached[1]) < LAN_CACHE_TTL:
