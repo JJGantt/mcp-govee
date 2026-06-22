@@ -40,13 +40,36 @@ LAN_CMD_PORT = 4003
 LAN_SCAN_TIMEOUT = 1.2
 LAN_CACHE_TTL = 30.0  # seconds to trust a discovered device IP before re-scanning
 
-# Load lights from env: GOVEE_LIGHT_<NAME>=<sku>,<device_id>,<display_name>
-LIGHTS = {}
-for key, val in os.environ.items():
-    if key.startswith("GOVEE_LIGHT_"):
-        name = key[len("GOVEE_LIGHT_"):].lower()
-        sku, device, display = val.split(",", 2)
-        LIGHTS[name] = {"sku": sku.strip(), "device": device.strip(), "name": display.strip()}
+# Lights come from Supabase govee_devices (auto-discovered + synced from the Govee cloud API). Falls
+# back to manual GOVEE_LIGHT_<NAME>=<sku>,<device_id>,<display_name> env vars if Supabase is unset/down.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://felyggqjjhltwokdfhop.supabase.co").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+
+def _load_lights() -> dict:
+    lights = {}
+    if SUPABASE_KEY:
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/govee_devices",
+                          params={"select": "key,device_id,sku,display_name", "hidden": "eq.false"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10)
+            for row in r.json():
+                lights[row["key"]] = {"sku": row["sku"], "device": row["device_id"], "name": row["display_name"]}
+        except Exception:  # noqa: BLE001 — fall through to env config
+            pass
+    if not lights:
+        for key, val in os.environ.items():
+            if key.startswith("GOVEE_LIGHT_"):
+                try:
+                    sku, device, display = val.split(",", 2)
+                    lights[key[len("GOVEE_LIGHT_"):].lower()] = {
+                        "sku": sku.strip(), "device": device.strip(), "name": display.strip()}
+                except ValueError:
+                    pass
+    return lights
+
+
+LIGHTS = _load_lights()
 
 NAMED_COLORS = {
     "red": (255, 0, 0),
