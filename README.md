@@ -4,24 +4,21 @@ MCP server for controlling Govee smart lights. Turn lights on/off, set brightnes
 
 ## Overview
 
-**govee-mcp** is a FastMCP server that communicates with Govee smart lights via their HTTP API. Lights are configured in a gitignored `.env-govee` file and exposed as MCP tools.
+**govee-mcp** is a FastMCP server that controls Govee lights **LAN-first, with the cloud REST API as
+a fallback** — a local command is ~10ms, has no rate limit, and survives a Govee cloud outage.
 
-Perfect for adding smart home control to your Claude conversations.
+The device inventory lives in Supabase `govee_devices`, synced from the Govee account by
+`sync_devices.py`. `GOVEE_LIGHT_*` env vars are the fallback for when Supabase is unreachable.
 
 ## Setup
 
-1. Copy `.env-govee.example` → `.env-govee`
-2. Add your Govee API key and light configurations:
+1. Copy `.env.example` → `.env-govee` and add `GOVEE_API_KEY` (needed for the cloud fallback and for
+   `sync_devices.py`).
+2. Seed the inventory: `python sync_devices.py` (or `--loop` on an always-on machine to refresh every
+   ~30 min — the `jared-voice` Fly app does this).
+3. Register the MCP server in Claude Code settings.
 
-```bash
-GOVEE_API_KEY=your_key_here
-
-# Format: GOVEE_LIGHT_<name>=<sku>,<device_id>,<display_name>
-GOVEE_LIGHT_bedroom_lamp=H6159,aabbccdd:eeffgghh,Bedroom Lamp
-GOVEE_LIGHT_kitchen_lights=H6052,11223344:55667788,Kitchen
-```
-
-3. Register the MCP server in Claude Code settings
+See [CLAUDE.md](CLAUDE.md) before changing any of it.
 
 ## MCP Tools
 
@@ -42,9 +39,12 @@ Colors can be specified as:
 
 ## Architecture
 
-- `govee_mcp.py` — Single-file FastMCP server
-- Uses Govee's `/router/api/v1/device/control` endpoint
-- Async HTTP client for fast control
+- `govee_mcp.py` — single-file FastMCP server. LAN: multicast scan to `239.255.255.250:4001`,
+  replies on `:4002`, commands to `<device_ip>:4003`, with a 30s cache of each discovered IP.
+  Cloud fallback: Govee's `/router/api/v1/device/control`.
+- `sync_devices.py` — pulls `/user/devices` into Supabase `govee_devices`, keeping only real lights
+  (a `light` type with a brightness capability, which drops `powerSwitch`-only ghosts) under
+  slugified stable keys. Devices off the account are removed; the `hidden` flag survives a sync.
 
 ## Related
 
