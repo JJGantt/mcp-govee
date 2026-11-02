@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import socket
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -55,8 +56,8 @@ def _load_lights() -> dict:
                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10)
             for row in r.json():
                 lights[row["key"]] = {"sku": row["sku"], "device": row["device_id"], "name": row["display_name"]}
-        except Exception:  # noqa: BLE001 — fall through to env config
-            pass
+        except Exception as e:  # noqa: BLE001 — fall through to env config
+            print(f"govee_devices read failed, using GOVEE_LIGHT_* env: {e}", file=sys.stderr)
     if not lights:
         for key, val in os.environ.items():
             if key.startswith("GOVEE_LIGHT_"):
@@ -70,6 +71,15 @@ def _load_lights() -> dict:
 
 
 LIGHTS = _load_lights()
+
+
+def _light(name: str) -> dict | None:
+    """The light called `name`, re-reading the inventory once when it is not known, so a lamp synced
+    or unhidden after this server started is found without a restart."""
+    if name not in LIGHTS:
+        LIGHTS.clear()
+        LIGHTS.update(_load_lights())
+    return LIGHTS.get(name)
 
 NAMED_COLORS = {
     "red": (255, 0, 0),
@@ -286,6 +296,8 @@ async def list_lights() -> str:
     for dev, ip in reachable.items():
         _lan_cache[dev] = (ip, now)
 
+    LIGHTS.clear()
+    LIGHTS.update(_load_lights())
     lines = []
     for name, info in LIGHTS.items():
         ip = reachable.get(info["device"])
@@ -322,9 +334,9 @@ async def set_power(light: str, state: str) -> str:
         light: Light name (e.g. 'floor_lamp')
         state: 'on' or 'off'
     """
-    if light not in LIGHTS:
+    info = _light(light)
+    if info is None:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
-    info = LIGHTS[light]
     value = 1 if state.lower() in ("on", "1", "true") else 0
     return await _send(
         info,
@@ -342,9 +354,9 @@ async def set_brightness(light: str, brightness: int) -> str:
         light: Light name (e.g. 'floor_lamp')
         brightness: 1–100
     """
-    if light not in LIGHTS:
+    info = _light(light)
+    if info is None:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
-    info = LIGHTS[light]
     brightness = max(1, min(100, brightness))
     return await _send(
         info,
@@ -364,9 +376,9 @@ async def set_color(light: str, color: str) -> str:
                yellow, teal, lavender, coral, lime, gold, indigo, magenta),
                hex string (#FF0000), or r,g,b values (255,0,0)
     """
-    if light not in LIGHTS:
+    info = _light(light)
+    if info is None:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
-    info = LIGHTS[light]
     try:
         color_int = parse_color(color)
     except ValueError as e:
@@ -388,9 +400,9 @@ async def set_color_temp(light: str, kelvin: int) -> str:
         light: Light name (e.g. 'floor_lamp')
         kelvin: Color temperature in Kelvin (2000–9000)
     """
-    if light not in LIGHTS:
+    info = _light(light)
+    if info is None:
         return f"Unknown light '{light}'. Available: {list(LIGHTS.keys())}"
-    info = LIGHTS[light]
     kelvin = max(2000, min(9000, kelvin))
     return await _send(
         info,

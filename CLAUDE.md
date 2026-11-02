@@ -7,8 +7,9 @@
 running `sync_devices.py`, not by editing the env file — and hiding one is the `hidden` column, which
 `sync_devices.py` deliberately preserves across syncs.
 
-`LIGHTS` is built **once at import**. A freshly synced or unhidden device is invisible until the MCP
-server is restarted.
+`list_lights` re-reads the inventory every call, and a command naming a light the server does not
+know re-reads it once before refusing, so a newly synced lamp works without a restart. A lamp hidden
+after start stays controllable by name until the server restarts.
 
 ## Transport is LAN-first, and the LAN half only works from home
 
