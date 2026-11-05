@@ -19,14 +19,27 @@ cloud REST API is the fallback for when the lamp doesn't answer.
 
 Two consequences worth knowing before debugging "it's slow" or "it doesn't work":
 
-- The process has to be on the same network as the lamp and able to receive UDP on 4002. The copy
-  running inside the `jared-voice` Fly app never gets a LAN answer and always takes the cloud path.
+- The process has to be on the same network as the lamp and able to receive UDP on 4002. A host that
+  never is sets `GOVEE_LAN=0`, which skips the scan: otherwise every command spends ~1.2s waiting
+  for a scan that cannot be answered before it reaches the cloud. The `jared-voice-worker` Fly app
+  sets it in its Dockerfile.
 - LAN control is a per-lamp setting in the Govee app. A lamp with it off silently uses the cloud.
 
-## Fly runs a copy, and it is not this checkout
+## The cloud is slow, and its failures must carry a message
 
-`voice-pipeline/server/assemble.sh` copies `govee_mcp.py` and `sync_devices.py` into the `jared-voice`
-image. A change here does not reach Fly until that app is reassembled and redeployed.
+The Govee cloud regularly takes several seconds to answer a command. Calls go through
+`_cloud_post`, with a 15s timeout and one retry on a timeout or connection failure. httpx's default
+5s timeout is too short, and its `ReadTimeout` has an empty message — a tool that lets it escape fails
+as a bare `Error executing tool set_color:` with nothing to say why. Every cloud failure, a rejected
+command included, raises `GoveeError` naming what went wrong, so the caller sees a real error rather
+than a success-shaped string.
+
+## Fly runs copies, and they are not this checkout
+
+`voice-pipeline/fly-worker/deploy.sh` copies `govee_mcp.py` into the `jared-voice-worker` image — the
+voice worker that claims requests first, so it is the copy that answers most light commands.
+`voice-pipeline/server/assemble.sh` copies `sync_devices.py` into the `jared-voice` image. A change
+here does not reach Fly until the app is redeployed with that script.
 
 ## Secrets
 

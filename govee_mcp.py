@@ -40,6 +40,14 @@ LAN_RECV_PORT = 4002
 LAN_CMD_PORT = 4003
 LAN_SCAN_TIMEOUT = 1.2
 LAN_CACHE_TTL = 30.0  # seconds to trust a discovered device IP before re-scanning
+# GOVEE_LAN=0 skips the LAN scan entirely, for a host that is never on the lamps' network (Fly): there
+# the scan can only time out, and it spends that time out of every command's budget.
+LAN_ENABLED = os.environ.get("GOVEE_LAN", "1") != "0"
+
+# The Govee cloud regularly takes several seconds to answer. httpx's 5s default turned those slow
+# answers into a ReadTimeout, whose message is empty, so the tool failed with a blank error.
+CLOUD_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+CLOUD_ATTEMPTS = 2
 
 # Lights come from Supabase govee_devices (auto-discovered + synced from the Govee cloud API). Falls
 # back to manual GOVEE_LIGHT_<NAME>=<sku>,<device_id>,<display_name> env vars if Supabase is unset/down.
@@ -238,6 +246,32 @@ def _lan_status_blocking(ip: str, timeout: float = 1.0) -> dict | None:
 # Cloud transport
 # ---------------------------------------------------------------------------
 
+class GoveeError(RuntimeError):
+    pass
+
+
+async def _cloud_post(path: str, payload: dict) -> dict:
+    """POST to the Govee cloud, retrying once on a timeout or connection failure. Raises GoveeError
+    with a message that names the failure, never a bare exception whose text is empty."""
+    last = None
+    for attempt in range(1, CLOUD_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=CLOUD_TIMEOUT) as client:
+                r = await client.post(f"{BASE_URL}{path}", json=payload, headers=HEADERS)
+            try:
+                return r.json()
+            except ValueError:
+                raise GoveeError(f"Govee cloud {path} answered HTTP {r.status_code} with non-JSON: {r.text[:200]}")
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last = e
+            if attempt < CLOUD_ATTEMPTS:
+                print(f"govee cloud {path} attempt {attempt} failed ({type(e).__name__}: {e}); retrying",
+                      file=sys.stderr)
+    msg = f"Govee cloud {path} failed after {CLOUD_ATTEMPTS} attempts: {type(last).__name__} {last}".rstrip()
+    print(f"ERROR {msg}", file=sys.stderr)
+    raise GoveeError(msg)
+
+
 async def _cloud_control(sku: str, device: str, cap_type: str, instance: str, value) -> dict:
     payload = {
         "requestId": str(uuid.uuid4()),
@@ -247,9 +281,7 @@ async def _cloud_control(sku: str, device: str, cap_type: str, instance: str, va
             "capability": {"type": cap_type, "instance": instance, "value": value},
         },
     }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{BASE_URL}/device/control", json=payload, headers=HEADERS)
-        return r.json()
+    return await _cloud_post("/device/control", payload)
 
 
 async def _cloud_state(sku: str, device: str) -> dict:
@@ -257,10 +289,8 @@ async def _cloud_state(sku: str, device: str) -> dict:
         "requestId": str(uuid.uuid4()),
         "payload": {"sku": sku, "device": device},
     }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{BASE_URL}/device/state", json=payload, headers=HEADERS)
-        data = r.json()
-        return {c["instance"]: c["state"]["value"] for c in data["payload"]["capabilities"]}
+    data = await _cloud_post("/device/state", payload)
+    return {c["instance"]: c["state"]["value"] for c in data["payload"]["capabilities"]}
 
 
 # ---------------------------------------------------------------------------
@@ -272,14 +302,16 @@ async def _send(info: dict, lan_msg: dict, cloud_cap: tuple, success_label: str)
 
     cloud_cap is (cap_type, instance, value).
     """
-    ip = await asyncio.to_thread(_resolve_lan_ip_blocking, info["device"])
+    ip = await asyncio.to_thread(_resolve_lan_ip_blocking, info["device"]) if LAN_ENABLED else None
     if ip:
         await asyncio.to_thread(_lan_send_blocking, ip, lan_msg)
         return f"{success_label} (via LAN)."
     result = await _cloud_control(info["sku"], info["device"], *cloud_cap)
     if result.get("code") == 200:
         return f"{success_label} (via cloud)."
-    return f"Failed (LAN unreachable, cloud error): {result}"
+    msg = f"Govee cloud rejected the command: {result}"
+    print(f"ERROR {msg}", file=sys.stderr)
+    raise GoveeError(msg)
 
 
 mcp = FastMCP("govee-lights")
@@ -291,7 +323,7 @@ async def list_lights() -> str:
 
     State is read over LAN when the lamp is reachable locally, otherwise via the cloud.
     """
-    reachable = await asyncio.to_thread(_lan_scan_blocking)
+    reachable = await asyncio.to_thread(_lan_scan_blocking) if LAN_ENABLED else {}
     now = time.time()
     for dev, ip in reachable.items():
         _lan_cache[dev] = (ip, now)
