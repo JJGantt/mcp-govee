@@ -24,8 +24,9 @@ Two consequences worth knowing before debugging "it's slow" or "it doesn't work"
   for a scan that cannot be answered before it reaches the cloud. The `jared-voice-worker` Fly app
   sets it in its Dockerfile.
 - LAN control is a per-lamp setting in the Govee app. A lamp with it off silently uses the cloud.
-  None of the lamps answer a LAN scan or a unicast `devStatus` from the Pi, so in practice every
-  command and every state read goes through the cloud.
+  The Floor Lamp (H6072) answers a LAN scan from the Pi and the Mac, though a single scan from the
+  Pi sometimes misses it. The three H6008 bulbs (Closet, both Bedroom ceiling) answer from neither
+  machine, with LAN Control on in the app, so they always go through the cloud.
 
 ## Cloud state is an echo, not a reading
 
