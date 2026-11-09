@@ -308,7 +308,8 @@ async def _send(info: dict, lan_msg: dict, cloud_cap: tuple, success_label: str)
         return f"{success_label} (via LAN)."
     result = await _cloud_control(info["sku"], info["device"], *cloud_cap)
     if result.get("code") == 200:
-        return f"{success_label} (via cloud)."
+        return (f"{success_label} (via cloud: accepted by Govee, not confirmed by the lamp — "
+                f"the cloud's state only echoes this command back).")
     msg = f"Govee cloud rejected the command: {result}"
     print(f"ERROR {msg}", file=sys.stderr)
     raise GoveeError(msg)
@@ -321,7 +322,10 @@ mcp = FastMCP("govee-lights")
 async def list_lights() -> str:
     """List all configured lights and their current state (online, power, brightness).
 
-    State is read over LAN when the lamp is reachable locally, otherwise via the cloud.
+    State is read from the lamp over LAN when it answers locally. Otherwise it comes from the Govee
+    cloud, whose power/brightness for these lamps is the last value COMMANDED, not a reading from the
+    lamp: it changes the instant a command is accepted, whether or not the lamp obeyed. Treat a
+    [cloud] line as "what was last sent", never as proof of what the light is doing.
     """
     reachable = await asyncio.to_thread(_lan_scan_blocking) if LAN_ENABLED else {}
     now = time.time()
@@ -351,7 +355,7 @@ async def list_lights() -> str:
             brightness = state.get("brightness", "?")
             lines.append(
                 f"{name} ({info['name']}): online={online}, power={power}, "
-                f"brightness={brightness}% [cloud]"
+                f"brightness={brightness}% [cloud: last commanded, not measured]"
             )
         except Exception as e:
             lines.append(f"{name} ({info['name']}): state unavailable ({e})")

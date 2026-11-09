@@ -24,6 +24,16 @@ Two consequences worth knowing before debugging "it's slow" or "it doesn't work"
   for a scan that cannot be answered before it reaches the cloud. The `jared-voice-worker` Fly app
   sets it in its Dockerfile.
 - LAN control is a per-lamp setting in the Govee app. A lamp with it off silently uses the cloud.
+  None of the lamps answer a LAN scan or a unicast `devStatus` from the Pi, so in practice every
+  command and every state read goes through the cloud.
+
+## Cloud state is an echo, not a reading
+
+For these lamps the cloud's `/device/state` power and brightness are the last value commanded: send
+brightness 60 and the next read says 60, whether or not the bulb changed. A light that missed a
+command therefore reads as obeying it. `list_lights` labels cloud lines "last commanded, not
+measured" and a cloud command says it was accepted, not confirmed, so the caller does not report
+either as what the light is doing. Only a LAN `devStatus` reply is a real reading.
 
 ## The cloud is slow, and its failures must carry a message
 
